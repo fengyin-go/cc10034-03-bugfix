@@ -26,7 +26,11 @@ class PositionStoreService(BaseModuleService):
 
     def save_position(self, instance: str, binlog_name: str, position: int,
                       gtid_set: str = "", source: str = "manual") -> PositionSnapshot:
-        """保存当前位点到管道总线。"""
+        """人工保存位点。
+
+        这是运维显式发布已确认位点，会成对写入已确认位点数据快照和回执；
+        检查点候选登记不走这里，因此不会污染恢复清单。
+        """
         ps = PositionSnapshot(
             instance=instance,
             binlog_name=binlog_name,
@@ -35,7 +39,7 @@ class PositionStoreService(BaseModuleService):
             updated_at=datetime.now(),
             source=source,
         )
-        pipeline_bus.register_position(ps)
+        pipeline_bus.publish_manual_position(ps)
         pipeline_bus.write_audit(
             "位点存储", f"{instance}:{binlog_name}",
             f"位点更新至 {binlog_name}:{position}",
@@ -44,18 +48,58 @@ class PositionStoreService(BaseModuleService):
         return ps
 
     def query_current_position(self, instance: str) -> dict[str, Any]:
-        """查询指定实例的当前位点。"""
-        ps = pipeline_bus.get_position(instance)
-        if ps is None:
+        """查询指定实例的当前位点。
+
+        只认已确认位点数据快照：检查点候选登记期间仍返回上一次确认的偏移，
+        没有任何确认记录时返回 found=False，而不是未确认的候选位置。
+        """
+        snapshot = pipeline_bus.get_confirmed_snapshot(instance)
+        if snapshot is None:
             return {"instance": instance, "found": False}
         return {
             "instance": instance,
             "found": True,
-            "binlog_name": ps.binlog_name,
-            "position": ps.position,
-            "gtid_set": ps.gtid_set,
-            "updated_at": ps.updated_at.isoformat(),
-            "source": ps.source,
+            "binlog_name": snapshot.binlog_file,
+            "position": snapshot.offset,
+            "gtid_set": snapshot.gtid_set,
+            "updated_at": snapshot.updated_at.isoformat(),
+            "source": snapshot.source,
+            "origin": snapshot.origin,
+            "checkpoint_id": snapshot.checkpoint_id,
+            "version": snapshot.version,
+        }
+
+    def recovery_manifest(self, instance: str) -> dict[str, Any]:
+        """位点恢复清单：与检查点管理共用同一份已确认位点数据快照。
+
+        偏移量、确认时间与确认回执在同一份快照里，读到的三者必然一致。
+        """
+        manifest = pipeline_bus.confirmed_snapshot_manifest(instance)
+        if manifest is None:
+            return {
+                "channel": instance,
+                "found": False,
+                "recovery_position": None,
+                "message": "没有已确认位点，不能从候选日志位置恢复",
+            }
+        return {**manifest, "recovery_position": manifest["position"]}
+
+    def pending_candidates(self, instance: str) -> dict[str, Any]:
+        """候选清单：只用于展示待确认检查点，明确标注不可作为恢复起点。"""
+        candidate = pipeline_bus.positions.get(instance)
+        if candidate is None:
+            return {"channel": instance, "found": False, "usable_for_recovery": False}
+        confirmed = pipeline_bus.get_confirmed_snapshot(instance)
+        return {
+            "channel": instance,
+            "found": True,
+            "binlog_file": candidate.binlog_name,
+            "offset": candidate.position,
+            "source": candidate.source,
+            "usable_for_recovery": False,
+            "confirmed_position": (
+                f"{confirmed.binlog_file}:{confirmed.offset}" if confirmed else None
+            ),
         }
 
     def compare_positions(self, pos_a: dict[str, Any], pos_b: dict[str, Any]) -> dict[str, Any]:

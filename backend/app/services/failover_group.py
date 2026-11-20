@@ -81,12 +81,10 @@ class FailoverGroupService(BaseModuleService):
             elapsed = (datetime.now() - pos.updated_at).total_seconds()
             return elapsed > timeout
         if condition == "checkpoint_stale":
-            commits = [cp for cp in pipeline_bus.checkpoints
-                       if cp.channel_name == channel and cp.committed]
-            if not commits:
+            snapshot = pipeline_bus.get_confirmed_snapshot(channel)
+            if snapshot is None:
                 return True
-            latest = commits[-1]
-            elapsed = (datetime.now() - latest.confirmed_at).total_seconds()
+            elapsed = (datetime.now() - snapshot.confirmed_at).total_seconds()
             return elapsed > timeout * 3
         if condition == "always":
             return True
@@ -117,8 +115,8 @@ class FailoverGroupService(BaseModuleService):
         """计算故障风险评分。"""
         primary = config["主通道"]
         heartbeat = self.heartbeat_check(primary)
-        checkpoint_commits = sum(1 for cp in pipeline_bus.checkpoints
-                                 if cp.channel_name == primary and cp.committed)
+        snapshot = pipeline_bus.get_confirmed_snapshot(primary)
+        checkpoint_commits = 1 if snapshot is not None else 0
         risk_score = 0
         if not heartbeat["healthy"]:
             risk_score += 50

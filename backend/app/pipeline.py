@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
+import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 
 
 @dataclass
@@ -63,6 +66,44 @@ class CheckpointRecord:
     confirmed_at: datetime
     committed: bool
     data_checksum: str
+    gtid_set: str = ""
+    # 候选 →（已确认 | 已回退 | 已过期），以及该检查点是否留下过已确认快照
+    state: str = "候选"
+    seq: int = 0
+    published_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ConfirmedPositionSnapshot:
+    """已确认位点数据快照。
+
+    只在检查点提交/回退成功时生成；position_store 的恢复清单与
+    query_current_position 都只读这份快照，候选登记期间不可见。
+    """
+    channel_name: str
+    checkpoint_id: str
+    binlog_file: str
+    offset: int
+    gtid_set: str
+    confirmed_at: datetime
+    updated_at: datetime
+    source: str
+    origin: str  # "commit" | "rollback" | "manual"
+    receipt: dict[str, Any]
+    version: int = 0
+    base_version: int = 0
+    # 回退时通道内已存在的最大登记序号；序号不超过它的提交会被回退覆盖
+    rollback_ceiling: int = 0
+
+
+@dataclass
+class CheckpointPublishResult:
+    """发布结果：只有发布成功时快照和回执才可见。"""
+    accepted: bool
+    checkpoint: CheckpointRecord | None = None
+    snapshot: ConfirmedPositionSnapshot | None = None
+    reason: str = ""
+    idempotent: bool = False
 
 
 class PipelineBus:
@@ -80,6 +121,15 @@ class PipelineBus:
         # 位点注册 — checkpoint_manager/position_store 写入，cdc_channel/failover_group 消费
         self.positions: dict[str, PositionSnapshot] = {}
         self.checkpoints: list[CheckpointRecord] = []
+        # 已确认位点数据快照 — 提交/回退成功后才原子发布，position_store 恢复清单与
+        # cdc_channel/failover_group 恢复起点都只读这里，候选登记不落在这里。
+        self.confirmed_positions: dict[str, ConfirmedPositionSnapshot] = {}
+        # 发布回执 — checkpoint_id → 终态回执；终态一旦记录，重试只回放、不改写
+        self.checkpoint_receipts: dict[str, dict[str, Any]] = {}
+        self._checkpoint_seq = 0
+        self._snapshot_version = 0
+        # 写锁：提交与回退互斥，保证通道内只发布单一有效快照
+        self.state_lock = threading.RLock()
         # Schema 注册 — schema_sync 写入，ddl_tracker/format_adapter 消费
         self.schema_registry: dict[str, list[dict[str, Any]]] = {}
         # SCD 状态 — scd_handler 核心存储
@@ -135,13 +185,229 @@ class PipelineBus:
         self.pipeline_metrics["total_output"] += len(batch)
         return batch
 
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """发布检查点时使用：提交与回退在同一通道上互斥。"""
+        with self.state_lock:
+            yield
+
     def register_position(self, pos: PositionSnapshot) -> None:
-        """注册存储位点。"""
+        """登记候选位点（草稿）。不会进入恢复清单，也不会成为当前位点。"""
         self.positions[pos.instance] = pos
 
     def get_position(self, instance: str) -> PositionSnapshot | None:
-        """查询当前位点。"""
-        return self.positions.get(instance)
+        """查询当前位点。
+
+        只有发不过确认快照的通道才有当前位点；候选登记期间返回 None，
+        调用方因此不会从尚未确认的日志位置恢复。
+        """
+        snapshot = self.confirmed_positions.get(instance)
+        if snapshot is None:
+            return None
+        return PositionSnapshot(
+            instance=snapshot.channel_name,
+            binlog_name=snapshot.binlog_file,
+            position=snapshot.offset,
+            gtid_set=snapshot.gtid_set,
+            updated_at=snapshot.updated_at,
+            source=snapshot.source,
+        )
+
+    def get_confirmed_snapshot(self, channel: str) -> ConfirmedPositionSnapshot | None:
+        """读取通道的已确认位点数据快照（恢复清单）。"""
+        return self.confirmed_positions.get(channel)
+
+    def confirmed_snapshot_manifest(self, channel: str) -> dict[str, Any] | None:
+        """通道恢复清单：位置、偏移量、确认回执一起可见。"""
+        snapshot = self.confirmed_positions.get(channel)
+        if snapshot is None:
+            return None
+        return {
+            "channel": channel,
+            "found": True,
+            "version": snapshot.version,
+            "checkpoint_id": snapshot.checkpoint_id,
+            "binlog_file": snapshot.binlog_file,
+            "offset": snapshot.offset,
+            "position": f"{snapshot.binlog_file}:{snapshot.offset}",
+            "gtid_set": snapshot.gtid_set,
+            "confirmed_at": snapshot.confirmed_at.isoformat(),
+            "updated_at": snapshot.updated_at.isoformat(),
+            "source": snapshot.source,
+            "origin": snapshot.origin,
+            "receipt": dict(snapshot.receipt),
+        }
+
+    def next_checkpoint_seq(self) -> int:
+        """检查点登记序号：同通道内提交/回退的冲突优先级以此为准。"""
+        self._checkpoint_seq += 1
+        return self._checkpoint_seq
+
+    def next_snapshot_version(self) -> int:
+        """已确认快照版本号：每发布一次递增，未发布不消耗。"""
+        self._snapshot_version += 1
+        return self._snapshot_version
+
+    def channel_checkpoints(self, channel: str) -> list[CheckpointRecord]:
+        """按登记顺序返回通道内检查点。"""
+        return [cp for cp in self.checkpoints if cp.channel_name == channel]
+
+    def publish_commit(self, checkpoint_id: str, now: datetime | None = None) -> CheckpointPublishResult:
+        """提交检查点：生成并原子发布已确认位点数据快照。
+
+        幂等：同一检查点重复提交只回放首次回执；已被回退的检查点不能再由
+        提交重试改写终态。
+        """
+        now = now or datetime.now()
+        with self.state_lock:
+            cp = self.find_checkpoint(checkpoint_id)
+            if cp is None:
+                return CheckpointPublishResult(False, reason="not found")
+            current = self.confirmed_positions.get(cp.channel_name)
+            if cp.state == "已回退":
+                return CheckpointPublishResult(
+                    False, checkpoint=cp,
+                    reason="checkpoint already rolled back",
+                )
+            if cp.state == "已过期":
+                return CheckpointPublishResult(
+                    False, checkpoint=cp, reason="checkpoint expired",
+                )
+            if cp.committed:
+                # 重试：不改写终态，只回放已经发布的回执。
+                snapshot = self.confirmed_positions.get(cp.channel_name)
+                if snapshot is not None and snapshot.checkpoint_id == cp.checkpoint_id:
+                    return CheckpointPublishResult(
+                        True, checkpoint=cp, snapshot=snapshot, idempotent=True,
+                    )
+                return CheckpointPublishResult(
+                    True, checkpoint=cp, idempotent=True, reason="already committed",
+                )
+            # 回退之后登记的新检查点（seq 大于回退时的上限）可以正常提交；
+            # 回退之前已登记、但没被这次回退覆盖掉终态的检查点则不能把起点推回去。
+            if (
+                current is not None
+                and current.origin == "rollback"
+                and cp.seq <= current.rollback_ceiling
+            ):
+                return CheckpointPublishResult(
+                    False, checkpoint=cp,
+                    reason=f"superseded by rollback to {current.checkpoint_id}",
+                )
+            cp.committed = True
+            cp.state = "已确认"
+            cp.confirmed_at = now
+            cp.published_at = now
+            return self._publish_snapshot(cp, origin="commit", now=now)
+
+    def publish_rollback(self, checkpoint_id: str, now: datetime | None = None) -> CheckpointPublishResult:
+        """回退到指定检查点：以目标检查点为已确认位点数据快照。
+
+        只影响目标检查点所属通道；回退本身幂等，重复回退不会改变已记录终态。
+        """
+        now = now or datetime.now()
+        with self.state_lock:
+            cp = self.find_checkpoint(checkpoint_id)
+            if cp is None:
+                return CheckpointPublishResult(False, reason="checkpoint not found")
+            if cp.state == "已过期":
+                return CheckpointPublishResult(
+                    False, checkpoint=cp, reason="checkpoint expired",
+                )
+            current = self.confirmed_positions.get(cp.channel_name)
+            if (
+                current is not None
+                and current.origin == "rollback"
+                and current.checkpoint_id == cp.checkpoint_id
+            ):
+                return CheckpointPublishResult(
+                    True, checkpoint=cp, snapshot=current, idempotent=True,
+                )
+            channel = cp.channel_name
+            # 通道内序号大于目标的检查点视为回退范围内的候选：撤销提交标记。
+            # 同一通道之外的检查点一概不动。
+            for other in self.channel_checkpoints(channel):
+                if other.seq > cp.seq and other.state != "已回退":
+                    other.committed = False
+                    other.state = "已回退"
+            cp.committed = True
+            cp.state = "已确认"
+            cp.published_at = now
+            rollback_ceiling = max(
+                (other.seq for other in self.channel_checkpoints(channel)), default=cp.seq)
+            return self._publish_snapshot(
+                cp, origin="rollback", now=now, rollback_ceiling=rollback_ceiling)
+
+    def _publish_snapshot(self, cp: CheckpointRecord, *, origin: str,
+                          now: datetime,
+                          rollback_ceiling: int = 0) -> CheckpointPublishResult:
+        """构造快照与回执，成对写入后才对外可见（调用方已持锁）。"""
+        confirmed_at = cp.confirmed_at if cp.state == "已确认" else now
+        receipt = {
+            "checkpoint_id": cp.checkpoint_id,
+            "channel": cp.channel_name,
+            "result": "已提交" if origin == "commit" else "已回退",
+            "result_at": now.isoformat(),
+            "binlog_file": cp.binlog_file,
+            "offset": cp.offset,
+            "position": f"{cp.binlog_file}:{cp.offset}",
+            "idempotent_replay": False,
+        }
+        self.checkpoint_receipts.setdefault(cp.checkpoint_id, receipt)
+        snapshot = ConfirmedPositionSnapshot(
+            channel_name=cp.channel_name,
+            checkpoint_id=cp.checkpoint_id,
+            binlog_file=cp.binlog_file,
+            offset=cp.offset,
+            gtid_set=cp.gtid_set,
+            confirmed_at=confirmed_at,
+            updated_at=now,
+            source="checkpoint_manager",
+            origin=origin,
+            receipt=receipt,
+            version=self.next_snapshot_version(),
+            base_version=cp.seq,
+            rollback_ceiling=rollback_ceiling,
+        )
+        # 快照与回执同一把锁内成对替换，读方永远看不到半份数据。
+        self.confirmed_positions[cp.channel_name] = snapshot
+        return CheckpointPublishResult(True, checkpoint=cp, snapshot=snapshot)
+
+    def publish_manual_position(self, pos: PositionSnapshot) -> ConfirmedPositionSnapshot:
+        """人工保存位点：由运维显式发布，等价于一次已确认发布。"""
+        now = pos.updated_at
+        receipt = {
+            "checkpoint_id": "",
+            "channel": pos.instance,
+            "result": "已发布",
+            "result_at": now.isoformat(),
+            "binlog_file": pos.binlog_name,
+            "offset": pos.position,
+            "position": f"{pos.binlog_name}:{pos.position}",
+            "idempotent_replay": False,
+        }
+        with self.state_lock:
+            snapshot = ConfirmedPositionSnapshot(
+                channel_name=pos.instance,
+                checkpoint_id="",
+                binlog_file=pos.binlog_name,
+                offset=pos.position,
+                gtid_set=pos.gtid_set,
+                confirmed_at=now,
+                updated_at=now,
+                source=pos.source,
+                origin="manual",
+                receipt=receipt,
+                version=self.next_snapshot_version(),
+            )
+            self.confirmed_positions[pos.instance] = snapshot
+        return snapshot
+
+    def find_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        for cp in self.checkpoints:
+            if cp.checkpoint_id == checkpoint_id:
+                return cp
+        return None
 
     def calc_position_lag(self, source_pos: PositionSnapshot, target_pos: PositionSnapshot) -> int:
         """计算两个位点之间的落后字节数。"""
@@ -321,6 +587,7 @@ class PipelineBus:
             "queue_depth": len(self.event_queue),
             "ddl_count": len(self.ddl_log),
             "position_count": len(self.positions),
+            "confirmed_position_count": len(self.confirmed_positions),
             "checkpoint_count": len(self.checkpoints),
             "register_count": len(self.schema_registry),
             "scd_type1_keys": len(self.scd_type1_store),

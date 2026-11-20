@@ -21,6 +21,34 @@ def require_service(module: str):
     return service
 
 
+@router.get("/position_store/{instance}/current", response_model=dict)
+def position_current(instance: str) -> dict[str, Any]:
+    """查询通道当前位点：只返回已确认位点数据快照。"""
+    service = require_service("position_store")
+    return service.query_current_position(instance)
+
+
+@router.get("/position_store/{instance}/recovery-manifest", response_model=dict)
+def position_recovery_manifest(instance: str) -> dict[str, Any]:
+    """位点恢复清单：与检查点管理共用同一份已确认位点数据快照。"""
+    service = require_service("position_store")
+    return service.recovery_manifest(instance)
+
+
+@router.get("/position_store/{instance}/candidates", response_model=dict)
+def position_candidates(instance: str) -> dict[str, Any]:
+    """候选位点清单：明确标注不可用作恢复起点。"""
+    service = require_service("position_store")
+    return service.pending_candidates(instance)
+
+
+@router.get("/checkpoint_manager/channel/{channel}/backup-position", response_model=dict)
+def checkpoint_backup_position(channel: str) -> dict[str, Any]:
+    """通道备份位点：最近一次已确认快照，供故障恢复读取。"""
+    service = require_service("checkpoint_manager")
+    return service.compute_backup_position(channel)
+
+
 @router.get("/{module}", response_model=PageResult[dict])
 def list_entries(
     module: str,
